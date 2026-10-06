@@ -355,7 +355,7 @@ static void drawFormatBits(BitBucket *modules, BitBucket *isFunction, uint8_t ec
 // based on this object's version field (which only has an effect for 7 <= version <= 40).
 static void drawVersion(BitBucket *modules, BitBucket *isFunction, uint8_t version) {
     
-    int8_t size = modules->bitOffsetOrWidth;
+    uint8_t size = modules->bitOffsetOrWidth;
 
 #if LOCK_VERSION != 0 && LOCK_VERSION < 7
     return;
@@ -630,11 +630,34 @@ static void rs_getRemainder(uint8_t degree, uint8_t *coeff, uint8_t *data, uint8
 
 #pragma mark - QrCode
 
+static int8_t getMode(const uint8_t *text, uint16_t length) {
+    if (isNumeric((char*)text, length)) { return MODE_NUMERIC; }
+    if (isAlphanumeric((char*)text, length)) { return MODE_ALPHANUMERIC; }
+    return MODE_BYTE;
+}
+
+// Returns the number of bits encodeDataCodewords will append (mode indicator,
+// character count and data), so the capacity can be checked before writing
+static uint32_t getEncodedBitLength(const uint8_t *text, uint16_t length, uint8_t version) {
+    int8_t mode = getMode(text, length);
+    uint32_t bits = 4 + getModeBits(version, mode);
+
+    if (mode == MODE_NUMERIC) {
+        bits += 10 * (uint32_t)(length / 3);
+        if (length % 3) { bits += (length % 3) * 3 + 1; }
+    } else if (mode == MODE_ALPHANUMERIC) {
+        bits += 11 * (uint32_t)(length / 2) + 6 * (length % 2);
+    } else {
+        bits += 8 * (uint32_t)length;
+    }
+
+    return bits;
+}
+
 static int8_t encodeDataCodewords(BitBucket *dataCodewords, const uint8_t *text, uint16_t length, uint8_t version) {
-    int8_t mode = MODE_BYTE;
-    
-    if (isNumeric((char*)text, length)) {
-        mode = MODE_NUMERIC;
+    int8_t mode = getMode(text, length);
+
+    if (mode == MODE_NUMERIC) {
         bb_appendBits(dataCodewords, 1 << MODE_NUMERIC, 4);
         bb_appendBits(dataCodewords, length, getModeBits(version, MODE_NUMERIC));
 
@@ -655,8 +678,7 @@ static int8_t encodeDataCodewords(BitBucket *dataCodewords, const uint8_t *text,
             bb_appendBits(dataCodewords, accumData, accumCount * 3 + 1);
         }
         
-    } else if (isAlphanumeric((char*)text, length)) {
-        mode = MODE_ALPHANUMERIC;
+    } else if (mode == MODE_ALPHANUMERIC) {
         bb_appendBits(dataCodewords, 1 << MODE_ALPHANUMERIC, 4);
         bb_appendBits(dataCodewords, length, getModeBits(version, MODE_ALPHANUMERIC));
 
@@ -775,34 +797,39 @@ uint16_t qrcode_getBufferSize(uint8_t version) {
     return bb_getGridSizeBytes(4 * version + 17);
 }
 
-// @TODO: Return error if data is too big.
-int8_t qrcode_initBytes(QRCode *qrcode, uint8_t *modules, uint8_t version, uint8_t ecc, uint8_t *data, uint16_t length) {
+int8_t qrcode_initBytes(QRCode *qrcode, uint8_t *modules, uint8_t version, uint8_t ecc, const uint8_t *data, uint16_t length) {
+#if LOCK_VERSION == 0
+    if (version < 1 || version > 40) { return -1; }
+#else
+    if (version != LOCK_VERSION) { return -1; }
+#endif
+    if (ecc > ECC_HIGH) { return -1; }
+
+    uint8_t eccFormatBits = (ECC_FORMAT_BITS >> (2 * ecc)) & 0x03;
+
+#if LOCK_VERSION == 0
+    uint16_t moduleCount = NUM_RAW_DATA_MODULES[version - 1];
+    uint16_t dataCapacity = moduleCount / 8 - NUM_ERROR_CORRECTION_CODEWORDS[eccFormatBits][version - 1];
+#else
+    uint16_t moduleCount = NUM_RAW_DATA_MODULES;
+    uint16_t dataCapacity = moduleCount / 8 - NUM_ERROR_CORRECTION_CODEWORDS[eccFormatBits];
+#endif
+
+    // Make sure the data fits before writing anything
+    if (getEncodedBitLength(data, length, version) > (uint32_t)dataCapacity * 8) { return -1; }
+
     uint8_t size = version * 4 + 17;
     qrcode->version = version;
     qrcode->size = size;
     qrcode->ecc = ecc;
     qrcode->modules = modules;
-    
-    uint8_t eccFormatBits = (ECC_FORMAT_BITS >> (2 * ecc)) & 0x03;
-    
-#if LOCK_VERSION == 0
-    uint16_t moduleCount = NUM_RAW_DATA_MODULES[version - 1];
-    uint16_t dataCapacity = moduleCount / 8 - NUM_ERROR_CORRECTION_CODEWORDS[eccFormatBits][version - 1];
-#else
-    version = LOCK_VERSION;
-    uint16_t moduleCount = NUM_RAW_DATA_MODULES;
-    uint16_t dataCapacity = moduleCount / 8 - NUM_ERROR_CORRECTION_CODEWORDS[eccFormatBits];
-#endif
-    
+
     struct BitBucket codewords;
     uint8_t codewordBytes[bb_getBufferSizeBytes(moduleCount)];
     bb_initBuffer(&codewords, codewordBytes, (int32_t)sizeof(codewordBytes));
-    
+
     // Place the data code words into the buffer
-    int8_t mode = encodeDataCodewords(&codewords, data, length, version);
-    
-    if (mode < 0) { return -1; }
-    qrcode->mode = mode;
+    qrcode->mode = encodeDataCodewords(&codewords, data, length, version);
     
     // Add terminator and pad up to a byte if applicable
     uint32_t padding = (dataCapacity * 8) - codewords.bitOffsetOrWidth;
@@ -853,11 +880,13 @@ int8_t qrcode_initBytes(QRCode *qrcode, uint8_t *modules, uint8_t version, uint8
 }
 
 int8_t qrcode_initText(QRCode *qrcode, uint8_t *modules, uint8_t version, uint8_t ecc, const char *data) {
-    return qrcode_initBytes(qrcode, modules, version, ecc, (uint8_t*)data, strlen(data));
+    size_t length = strlen(data);
+    if (length > UINT16_MAX) { return -1; }
+    return qrcode_initBytes(qrcode, modules, version, ecc, (const uint8_t*)data, (uint16_t)length);
 }
 
 bool qrcode_getModule(QRCode *qrcode, uint8_t x, uint8_t y) {
-    if (x < 0 || x >= qrcode->size || y < 0 || y >= qrcode->size) {
+    if (x >= qrcode->size || y >= qrcode->size) {
         return false;
     }
 
