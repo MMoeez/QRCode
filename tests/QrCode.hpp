@@ -245,6 +245,8 @@ private:
 	// Returns the number of 8-bit data (i.e. not error correction) codewords contained in any
 	// QR Code of the given version number and error correction level, with remainder bits discarded.
 	// This stateless pure function could be implemented as a (40*4)-cell lookup table.
+	// (Made public in this test copy so run-tests.cpp can compute exact capacities.)
+public:
 	static int getNumDataCodewords(int ver, const Ecc &ecl);
 	
 	
